@@ -622,6 +622,18 @@ pub struct StatsResponse {
     /// (kunobi-ninja/kache#131). Defaulted for old-daemon/new-client mixes.
     #[serde(default)]
     pub in_flight: Vec<InFlightEntry>,
+    /// The daemon's OWN resolved remote, independent of the requesting
+    /// client's env/config (kunobi-ninja/kache#706). Lets a client detect
+    /// when what it would configure differs from what the running daemon
+    /// actually resolved at startup — see `crate::cli::render_stats` and
+    /// `crate::cli::doctor`. `"not configured"` when the daemon has no
+    /// remote. Named distinctly from a general daemon-effective-config
+    /// mechanism (kunobi-ninja/kache#703, not yet merged to this branch) so
+    /// the two compose without conflict: a later merge can fold this into
+    /// that mechanism's struct or keep it alongside as its remote-specific
+    /// field. Defaulted for old-daemon/new-client mixes.
+    #[serde(default)]
+    pub effective_remote: String,
 }
 
 /// One in-flight compile as reported to stats consumers (`kache monitor`'s
@@ -1723,6 +1735,7 @@ impl Daemon {
                 list_keys_total: ps.list_keys_total.load(Ordering::Relaxed),
             },
             in_flight,
+            effective_remote: self.config.effective_remote_summary(),
         })
     }
 
@@ -6040,6 +6053,7 @@ mod tests {
                 typical_s: None,
                 eta_s: None,
             }],
+            effective_remote: "not configured".to_string(),
         })
         .unwrap();
         old.as_object_mut().unwrap().remove("in_flight");
@@ -7410,6 +7424,7 @@ mod tests {
             recent_transfers: Vec::new(),
             prefetch: PrefetchStatsSnapshot::default(),
             in_flight: Vec::new(),
+            effective_remote: "not configured".to_string(),
         };
         let resp = Response::ok_stats(stats.clone());
         let json = serde_json::to_string(&resp).unwrap();
@@ -7482,6 +7497,7 @@ mod tests {
             recent_transfers: Vec::new(),
             prefetch: PrefetchStatsSnapshot::default(),
             in_flight: Vec::new(),
+            effective_remote: "not configured".to_string(),
         };
         let resp = Response::ok_stats(stats);
         let json = serde_json::to_string(&resp).unwrap();

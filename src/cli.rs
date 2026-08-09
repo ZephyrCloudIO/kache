@@ -42,6 +42,12 @@ pub(crate) struct StatsSnapshot {
     /// In-flight miss compiles (kunobi-ninja/kache#131); empty when the
     /// daemon is unreachable (the TUI then falls back to tailed heartbeats).
     pub in_flight: Vec<daemon::InFlightEntry>,
+    /// The daemon's own resolved remote (kunobi-ninja/kache#706), so
+    /// `render_stats`/`doctor` can flag a mismatch against this client's own
+    /// `config.effective_remote_summary()` instead of only ever showing the
+    /// client's belief. Empty when the daemon is unreachable (nothing to
+    /// compare against — not the same as `"not configured"`).
+    pub daemon_effective_remote: String,
 }
 
 impl Default for StatsSnapshot {
@@ -85,6 +91,7 @@ impl Default for StatsSnapshot {
             blob_stats: None,
             prefetch: daemon::PrefetchStatsSnapshot::default(),
             in_flight: Vec::new(),
+            daemon_effective_remote: String::new(),
         }
     }
 }
@@ -149,6 +156,7 @@ pub(crate) fn fetch_stats_snapshot(
             blob_stats: blob_stats(),
             prefetch: resp.prefetch,
             in_flight: resp.in_flight,
+            daemon_effective_remote: resp.effective_remote,
         };
     }
 
@@ -182,6 +190,7 @@ pub(crate) fn fetch_stats_snapshot(
             blob_stats: blob_stats(),
             prefetch: resp.prefetch,
             in_flight: resp.in_flight,
+            daemon_effective_remote: resp.effective_remote,
         };
     }
 
@@ -274,6 +283,7 @@ pub(crate) fn snapshot_from_direct_reads(
         blob_stats: store.as_ref().and_then(|s| s.blob_stats().ok()),
         prefetch: daemon::PrefetchStatsSnapshot::default(),
         in_flight: Vec::new(),
+        daemon_effective_remote: String::new(),
     }
 }
 
@@ -416,6 +426,22 @@ pub(crate) fn render_stats(
         lines.push(format!("Remote:     MISCONFIGURED — {reason}"));
     } else {
         lines.push("Remote:     not configured".to_string());
+    }
+
+    // kunobi-ninja/kache#706: the line above is this CLIENT's own belief
+    // (its own env + config file). The daemon that actually serves builds
+    // resolves its remote independently (deterministically, from the file
+    // alone, since `Config::load_daemon`) and can legitimately differ from
+    // what this client would configure — flag it instead of leaving the
+    // "Remote:" line to silently speak for a daemon it never asked.
+    if snap.daemon_connected {
+        let client_belief = config.effective_remote_summary();
+        if snap.daemon_effective_remote != client_belief {
+            lines.push(format!(
+                "            \x1b[33mMISMATCH — daemon actually resolved: {}\x1b[0m",
+                snap.daemon_effective_remote
+            ));
+        }
     }
 
     // Prefetch/planning baseline (#485 Phase 0). Shown only when the daemon
@@ -2304,8 +2330,9 @@ fn is_doctor_issue(pass: bool, optional: bool) -> bool {
 /// Labels of the daemon-related checks that become informational when the
 /// daemon is optional. Kept in sync with the check constructions in
 /// [`doctor`]; module-level so the disposition logic below is unit-testable.
-const DAEMON_CHECK_LABELS: [&str; 5] = [
+const DAEMON_CHECK_LABELS: [&str; 6] = [
     "Daemon version",
+    "Daemon remote",
     "Daemon service",
     "Daemon processes",
     "Stale locks",
@@ -2656,7 +2683,50 @@ pub fn doctor(
         }
     }
 
-    // 9. Daemon service installed
+    // 9. Daemon remote match (kunobi-ninja/kache#706): the daemon resolves
+    //    its remote independently of this CLI process (deterministically,
+    //    from the config file alone — see `Config::load_daemon`), so it can
+    //    legitimately differ from what this process would itself configure.
+    //    Surface the mismatch instead of letting checks 5/8 each report a
+    //    partial, self-consistent-looking picture that disagrees with the
+    //    other.
+    if let Some(ref cfg) = config {
+        match crate::daemon::send_stats_request(cfg, false, None, None) {
+            Ok(stats) => {
+                let client_belief = cfg.effective_remote_summary();
+                let remote_match = stats.effective_remote == client_belief;
+                checks.push(Check {
+                    label: "Daemon remote",
+                    pass: remote_match,
+                    detail: if remote_match {
+                        stats.effective_remote
+                    } else {
+                        format!(
+                            "this process would use {client_belief:?}, but the running daemon \
+                             resolved {:?}",
+                            stats.effective_remote
+                        )
+                    },
+                    fix: if remote_match {
+                        None
+                    } else {
+                        Some(
+                            "the daemon's remote comes from the config file, not this \
+                             process's env — edit ~/.config/kache/config.toml [cache.remote], \
+                             then `kache daemon restart`"
+                                .into(),
+                        )
+                    },
+                });
+            }
+            Err(_) => {
+                // Daemon unreachable: already covered by check 8 above, and
+                // there is nothing to compare against.
+            }
+        }
+    }
+
+    // 10. Daemon service installed
     if let Some(service_path) = crate::service::service_file_path() {
         let installed = service_path.exists();
         checks.push(Check {
@@ -2675,7 +2745,7 @@ pub fn doctor(
         });
     }
 
-    // 10. Lingering live kache daemon processes — if the socket isn't reachable
+    // 11. Lingering live kache daemon processes — if the socket isn't reachable
     //     but `kache daemon run` processes exist, something got stuck.
     //     `kache daemon restart` now force-recovers this automatically.
     if let Some(ref cfg) = config {
@@ -2719,7 +2789,7 @@ pub fn doctor(
         }
     }
 
-    // 11. Stale lock files — when no daemon is running, leftover lock files
+    // 12. Stale lock files — when no daemon is running, leftover lock files
     //     are legacy cruft from an unclean shutdown. Harmless but worth
     //     surfacing so users know `daemon restart` will tidy them up.
     if let Some(ref cfg) = config {
@@ -2764,7 +2834,7 @@ pub fn doctor(
         }
     }
 
-    // 12. Service plist exe mismatch (macOS/Linux) — if the registered
+    // 13. Service plist exe mismatch (macOS/Linux) — if the registered
     //     service points to a binary that no longer exists or differs from
     //     the current `kache`, the daemon will relaunch the wrong binary.
     if let Some(service_path) = crate::service::service_file_path()

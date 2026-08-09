@@ -509,7 +509,16 @@ fn main() -> Result<()> {
         }) => service::status(),
         Some(Commands::Daemon {
             command: Some(DaemonCommands::Run),
-        }) => daemon::run_server(&config),
+        }) => {
+            // kunobi-ninja/kache#706: the daemon's remote must be a
+            // deterministic function of the config file, not of whichever
+            // process's ambient env happened to spawn `kache daemon run`
+            // (a racing wrapper auto-start, launchd, systemd, or a human).
+            // Reload with `load_daemon()` rather than reusing the generic
+            // `config` above, which every other subcommand shares and which
+            // deliberately keeps the normal env-over-file precedence.
+            daemon::run_server(&config::Config::load_daemon()?)
+        }
         Some(Commands::Daemon {
             command: Some(DaemonCommands::Start),
         }) => match daemon::start_daemon_background() {

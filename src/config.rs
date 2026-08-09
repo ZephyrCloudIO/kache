@@ -307,6 +307,21 @@ impl Config {
         }
         anyhow::bail!("No remote configured. Run `kache config` to set one up.")
     }
+
+    /// A short, human-readable summary of this `Config`'s resolved remote,
+    /// suitable for direct string comparison against another process's
+    /// summary of the same shape (kunobi-ninja/kache#706). Used both for the
+    /// daemon's own `StatsResponse::effective_remote` and for a client's
+    /// local belief, so `crate::cli::render_stats` / `crate::cli::doctor`
+    /// can flag a mismatch between the two with a plain `!=` rather than
+    /// parsing structured fields.
+    pub fn effective_remote_summary(&self) -> String {
+        match &self.remote {
+            Some(remote) => remote.describe(),
+            None if self.local_only => "local-only mode (remote ignored)".to_string(),
+            None => "not configured".to_string(),
+        }
+    }
 }
 
 impl RemoteConfig {
@@ -830,7 +845,39 @@ fn warn_ignored_env_overrides() {
 }
 
 impl Config {
+    /// Load config the normal way: every setting, including remote, follows
+    /// the standard env-over-file precedence (see module docs and
+    /// `docs/remote-cache/s3-setup.mdx` "Environment overrides"). Used by the
+    /// wrapper's compile-time hot path and every CLI subcommand except the
+    /// daemon's own startup.
     pub fn load() -> Result<Self> {
+        Self::load_impl(false)
+    }
+
+    /// Load config for the long-running daemon process (`kache daemon run`).
+    ///
+    /// Identical to [`Config::load`] except remote resolution ignores
+    /// environment entirely and is resolved from the config file alone
+    /// (kunobi-ninja/kache#706). The daemon's `Config` is loaded exactly once
+    /// at process start and then held for the process's lifetime (see
+    /// `docs/daemon/lifecycle.mdx` "Automatic restart on binary update" and
+    /// `docs/remote-cache/ci.mdx`'s "an already-running daemon cannot see new
+    /// environment values") — but *which* environment gets captured used to
+    /// depend on whatever process happened to auto-spawn `kache daemon run`
+    /// (a racing wrapper, launchd, systemd, or a human's shell), which is
+    /// invisible and non-reproducible. The config *file* is the one input
+    /// that is genuinely the same regardless of who started the daemon, so
+    /// it — not ambient env — is the daemon's authoritative source for
+    /// remote. Every other setting keeps today's env-over-file precedence:
+    /// this file is the one already-documented, deliberate exception
+    /// (`~/.config/kache/config.toml [cache.remote]` as "a machine-level
+    /// mitigation" per the original bug report), now applied automatically
+    /// instead of requiring the operator to know about it.
+    pub fn load_daemon() -> Result<Self> {
+        Self::load_impl(true)
+    }
+
+    fn load_impl(force_file_only_remote: bool) -> Result<Self> {
         let file_config = Self::load_file_config();
         let ignore_env = Self::ignore_env_enabled(&file_config);
         if ignore_env {
@@ -1176,7 +1223,7 @@ impl Config {
         let (remote, remote_error) = if local_only {
             (None, None)
         } else {
-            match Self::load_remote_config(&file_config) {
+            match Self::load_remote_config(&file_config, force_file_only_remote) {
                 Ok(remote) => (remote, None),
                 Err(error) => {
                     let reason = format!("{error:#}");
@@ -1271,8 +1318,21 @@ impl Config {
         toml::from_str(&content).context("parsing kache config file")
     }
 
-    fn load_remote_config(file_config: &Result<FileConfig>) -> Result<Option<RemoteConfig>> {
-        let ignore_env = Self::ignore_env_enabled(file_config);
+    /// Resolve `[cache.remote]` from the file and (unless `force_file_only`)
+    /// the `KACHE_S3_*` / `KACHE_PLANNER_*`-adjacent env overrides.
+    ///
+    /// `force_file_only` exists for [`Config::load_daemon`] (kunobi-ninja/kache#706):
+    /// the long-running daemon process's remote must be a deterministic
+    /// function of the config file alone, never of whichever process's
+    /// ambient environment happened to spawn it (an auto-restarting wrapper,
+    /// launchd/systemd, or a plain `kache daemon run`). Reusing the existing
+    /// `ignore_env` gate here — rather than a parallel code path — keeps this
+    /// one function the single source of truth for file-vs-env precedence.
+    fn load_remote_config(
+        file_config: &Result<FileConfig>,
+        force_file_only: bool,
+    ) -> Result<Option<RemoteConfig>> {
+        let ignore_env = force_file_only || Self::ignore_env_enabled(file_config);
         let file_remote = file_config
             .as_ref()
             .ok()
@@ -3596,7 +3656,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
             }),
         };
 
-        let remote = Config::load_remote_config(&Ok(file))
+        let remote = Config::load_remote_config(&Ok(file), false)
             .expect("valid remote config")
             .expect("remote from file");
         assert_eq!(remote.prefix, "myprefix");
@@ -3619,10 +3679,147 @@ exclude = ["src/generated/**", "vendor/problem/**"]
             }),
         };
         assert!(
-            Config::load_remote_config(&Ok(empty))
+            Config::load_remote_config(&Ok(empty), false)
                 .expect("empty config is valid")
                 .is_none()
         );
+    }
+
+    /// kunobi-ninja/kache#706: `force_file_only` must ignore `KACHE_S3_*` env
+    /// entirely and resolve purely from the file — this is the mechanism
+    /// [`Config::load_daemon`] uses so the daemon's remote does not depend on
+    /// whichever process's ambient environment happened to spawn it.
+    #[test]
+    fn force_file_only_ignores_env_and_uses_the_file() {
+        let _guard = config_path_lock();
+        let _bucket = set_env_var_for_test("KACHE_S3_BUCKET", "env-bucket");
+        let _region = set_env_var_for_test("KACHE_S3_REGION", "env-region");
+
+        let file = FileConfig {
+            cc: None,
+            paths: None,
+            cache: Some(CacheFileConfig {
+                planner: None,
+                remote: Some(RemoteFileConfig {
+                    _type: Some("s3".to_string()),
+                    bucket: Some("file-bucket".to_string()),
+                    region: Some("file-region".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+
+        // Without force_file_only, env wins (existing precedence, unchanged).
+        let env_wins = Config::load_remote_config(&Ok(file.clone()), false)
+            .expect("valid remote config")
+            .expect("remote");
+        let RemoteBackendConfig::S3(s3) = env_wins.backend else {
+            panic!("expected S3 remote");
+        };
+        assert_eq!(s3.bucket, "env-bucket");
+        assert_eq!(s3.region, "env-region");
+
+        // With force_file_only, the env overrides are ignored entirely.
+        let file_wins = Config::load_remote_config(&Ok(file), true)
+            .expect("valid remote config")
+            .expect("remote");
+        let RemoteBackendConfig::S3(s3) = file_wins.backend else {
+            panic!("expected S3 remote");
+        };
+        assert_eq!(s3.bucket, "file-bucket");
+        assert_eq!(s3.region, "file-region");
+    }
+
+    /// kunobi-ninja/kache#706: with `force_file_only` and no file-configured
+    /// remote, an env-only remote (the documented CI/per-checkout pattern —
+    /// see `docs/remote-cache/s3-setup.mdx` "Environment overrides") must
+    /// NOT leak through. This is the exact defect: a daemon auto-started by
+    /// a wrapper that happened to inherit `KACHE_S3_*` must not silently
+    /// treat that as its own remote.
+    #[test]
+    fn force_file_only_does_not_fall_back_to_env_when_file_has_no_remote() {
+        let _guard = config_path_lock();
+        let _bucket = set_env_var_for_test("KACHE_S3_BUCKET", "env-only-bucket");
+
+        let file = FileConfig {
+            cc: None,
+            paths: None,
+            cache: Some(CacheFileConfig {
+                planner: None,
+                remote: None,
+                ..Default::default()
+            }),
+        };
+
+        assert!(
+            Config::load_remote_config(&Ok(file), true)
+                .expect("valid config")
+                .is_none(),
+            "force_file_only must not resolve a remote from env alone"
+        );
+    }
+
+    /// kunobi-ninja/kache#706: `Config::load_daemon()` — the entry point
+    /// `kache daemon run` actually calls — must resolve the SAME remote
+    /// regardless of which of two different ambient environments spawned it,
+    /// as long as the config *file* is unchanged. This directly models the
+    /// reported bug: two different worktrees with different per-checkout
+    /// `KACHE_S3_*` env, sharing one daemon process.
+    #[test]
+    fn load_daemon_is_deterministic_across_different_spawning_envs() {
+        let _guard = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("kache/config.toml");
+        let _config_guard = set_kache_config_for_test(&config_path);
+
+        let file = FileConfig {
+            cc: None,
+            paths: None,
+            cache: Some(CacheFileConfig {
+                planner: None,
+                remote: Some(RemoteFileConfig {
+                    _type: Some("s3".to_string()),
+                    bucket: Some("pinned-bucket".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+        Config::save_file_config_to(&file, &config_path).unwrap();
+
+        // "Worktree A": KACHE_S3_* set in this process's ambient env.
+        {
+            let _isolated = isolate_s3_env();
+            let _bucket = set_env_var_for_test("KACHE_S3_BUCKET", "worktree-a-bucket");
+            let resolved = Config::load_daemon()
+                .expect("load_daemon must succeed")
+                .remote
+                .expect("remote must resolve");
+            let RemoteBackendConfig::S3(s3) = resolved.backend else {
+                panic!("expected S3 remote");
+            };
+            assert_eq!(
+                s3.bucket, "pinned-bucket",
+                "load_daemon must ignore worktree A's ambient env"
+            );
+        }
+
+        // "Worktree B": no KACHE_S3_* in this process's ambient env at all.
+        {
+            let _isolated = isolate_s3_env();
+            let resolved = Config::load_daemon()
+                .expect("load_daemon must succeed")
+                .remote
+                .expect("remote must resolve");
+            let RemoteBackendConfig::S3(s3) = resolved.backend else {
+                panic!("expected S3 remote");
+            };
+            assert_eq!(
+                s3.bucket, "pinned-bucket",
+                "load_daemon must resolve the same remote regardless of spawning env"
+            );
+        }
     }
 
     #[test]
@@ -3643,7 +3840,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
             }),
         };
 
-        let remote = Config::load_remote_config(&Ok(file))
+        let remote = Config::load_remote_config(&Ok(file), false)
             .expect("valid filesystem config")
             .expect("filesystem remote");
         assert_eq!(remote.prefix, "shared");
@@ -3674,7 +3871,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
             }),
         };
 
-        let remote = Config::load_remote_config(&Ok(file))
+        let remote = Config::load_remote_config(&Ok(file), false)
             .expect("valid filesystem config")
             .expect("filesystem remote");
         assert_eq!(remote.prefix, "file-prefix");
@@ -3701,7 +3898,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
             ..Default::default()
         };
 
-        let error = Config::load_remote_config(&Ok(file))
+        let error = Config::load_remote_config(&Ok(file), false)
             .expect_err("filesystem drive prefix must be rejected")
             .to_string();
         assert!(error.contains("cannot contain ':'"), "{error}");
@@ -3722,7 +3919,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
             }),
         };
 
-        let remote = Config::load_remote_config(&Ok(file))
+        let remote = Config::load_remote_config(&Ok(file), false)
             .expect("legacy config is valid")
             .expect("legacy S3 remote");
         assert!(matches!(
@@ -3747,7 +3944,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
             ..Default::default()
         };
 
-        let error = Config::load_remote_config(&Ok(file))
+        let error = Config::load_remote_config(&Ok(file), false)
             .expect_err("empty S3 bucket must be rejected")
             .to_string();
         assert!(error.contains("non-empty bucket"), "{error}");
@@ -3773,7 +3970,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
                 }),
                 ..Default::default()
             };
-            let remote = Config::load_remote_config(&Ok(file))
+            let remote = Config::load_remote_config(&Ok(file), false)
                 .unwrap_or_else(|e| panic!("{configured:?} must not fail: {e:#}"))
                 .expect("remote");
             assert_eq!(remote.prefix, expected, "{configured:?}");
@@ -3787,7 +3984,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
         let _bucket = set_env_var_for_test("KACHE_S3_BUCKET", "legacy-bucket");
         let _prefix = set_env_var_for_test("KACHE_S3_PREFIX", "");
 
-        let remote = Config::load_remote_config(&Ok(FileConfig::default()))
+        let remote = Config::load_remote_config(&Ok(FileConfig::default()), false)
             .expect("empty prefix must be accepted")
             .expect("remote");
         assert_eq!(remote.prefix, "");
@@ -3812,7 +4009,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
         };
 
         assert!(
-            Config::load_remote_config(&Ok(file))
+            Config::load_remote_config(&Ok(file), false)
                 .expect("empty override is not an error without an explicit type")
                 .is_none(),
             "an empty KACHE_S3_BUCKET must not select the file-configured bucket"
@@ -3891,7 +4088,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
             }),
         };
 
-        let remote = Config::load_remote_config(&Ok(file))
+        let remote = Config::load_remote_config(&Ok(file), false)
             .expect("an empty prefix must be usable")
             .expect("remote");
         assert_eq!(remote.prefix, "");
@@ -3913,7 +4110,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
             }),
         };
 
-        let error = Config::load_remote_config(&Ok(file))
+        let error = Config::load_remote_config(&Ok(file), false)
             .expect_err("mixed backend fields must be rejected")
             .to_string();
         assert!(error.contains("cannot include S3"), "{error}");
